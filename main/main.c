@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -49,6 +50,16 @@ static const ble_uuid128_t CHAR_UUID =
 // HX711_SCALE = (raw_reading - tare_offset) / known_grams
 #define HX711_SCALE 420.0f
 
+// ---- Drink detection ----
+#define WATER_DENSITY_G_PER_ML 1.0f  // water: 1 g == 1 mL
+#define TILT_DRINK_DEG      40.0f    // tilt above this = drinking in progress
+#define TILT_UPRIGHT_DEG    25.0f    // tilt below this = cup upright / at rest
+#define TILT_POUROUT_DEG    100.0f   // max tilt beyond this = pour-out, ignore the drop
+#define MIN_SIP_G           5.0f     // ignore weight drops smaller than this (noise)
+#define WEIGHT_STABLE_G     3.0f     // max spread (g) across reads to call weight settled
+#define SETTLE_TIMEOUT_MS   8000     // give up waiting for the weight to settle
+#define BASELINE_REFRESH_US 2000000  // min interval between idle baseline refreshes
+
 static uint16_t conn_handle = 0;
 static bool connected = false;
 static uint16_t char_val_handle;
@@ -61,7 +72,12 @@ static bool hx711_ok = false;
 static int32_t hx711_offset = 0;
 static portMUX_TYPE hx711_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static const char *WATER_MSG = "You drank 300 mL of water";
+// Gravity direction captured at boot while upright; basis for the tilt angle.
+static float grav_ref[3] = {0.0f, 0.0f, 1.0f};
+static bool grav_ref_ok = false;
+
+// Last reported sip volume (mL), exposed via the BLE read.
+static int last_ml = 0;
 
 // ---------------- ADXL345 ----------------
 
@@ -140,6 +156,38 @@ static bool adxl345_read_g(float *x, float *y, float *z) {
     *x = rx / ADXL345_LSB_PER_G;
     *y = ry / ADXL345_LSB_PER_G;
     *z = rz / ADXL345_LSB_PER_G;
+    return true;
+}
+
+// Average a handful of accel samples to lock in the upright orientation.
+static void capture_upright_ref(void) {
+    float x, y, z, sx = 0, sy = 0, sz = 0;
+    int got = 0;
+    for (int i = 0; i < 32; i++) {
+        if (adxl345_read_g(&x, &y, &z)) { sx += x; sy += y; sz += z; got++; }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (got == 0) { ESP_LOGW(TAG, "upright ref: no accel data"); return; }
+    float mag = sqrtf(sx * sx + sy * sy + sz * sz);
+    if (mag < 1e-3f) return;
+    grav_ref[0] = sx / mag;
+    grav_ref[1] = sy / mag;
+    grav_ref[2] = sz / mag;
+    grav_ref_ok = true;
+    ESP_LOGI(TAG, "upright ref: %.2f %.2f %.2f", grav_ref[0], grav_ref[1], grav_ref[2]);
+}
+
+// Angle (deg) between current gravity and the upright reference. 0 = upright,
+// 90 = on its side, 180 = fully inverted.
+static bool tilt_angle_deg(float *deg) {
+    float x, y, z;
+    if (!adxl345_read_g(&x, &y, &z)) return false;
+    float mag = sqrtf(x * x + y * y + z * z);
+    if (mag < 1e-3f) return false;
+    float dot = (x * grav_ref[0] + y * grav_ref[1] + z * grav_ref[2]) / mag;
+    if (dot > 1.0f) dot = 1.0f;
+    if (dot < -1.0f) dot = -1.0f;
+    *deg = acosf(dot) * 57.2957795f;
     return true;
 }
 
@@ -228,7 +276,9 @@ static bool hx711_grams(float *grams) {
 static int char_access_cb(uint16_t conn, uint16_t attr,
                           struct ble_gatt_access_ctxt *ctxt, void *arg) {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        os_mbuf_append(ctxt->om, WATER_MSG, strlen(WATER_MSG));
+        char buf[16];
+        int n = snprintf(buf, sizeof(buf), "%d", last_ml);
+        os_mbuf_append(ctxt->om, buf, n);
     }
     return 0;
 }
@@ -306,70 +356,144 @@ static void nimble_host_task(void *param) {
     nimble_port_freertos_deinit();
 }
 
-static void build_message(char *msg, size_t len) {
-    int n = snprintf(msg, len, "%s", WATER_MSG);
-
-    float x, y, z;
-    if (adxl345_read_g(&x, &y, &z)) {
-        n += snprintf(msg + n, len - n,
-                      " | accel x=%.2f y=%.2f z=%.2f g", x, y, z);
+static void send_ml(int ml) {
+    last_ml = ml;
+    char buf[16];
+    int n = snprintf(buf, sizeof(buf), "%d", ml);
+    if (connected) {
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, n);
+        ble_gatts_notify_custom(conn_handle, char_val_handle, om);
+        ESP_LOGI(TAG, "sip sent: %d mL", ml);
     } else {
-        n += snprintf(msg + n, len - n, " | accel n/a");
-    }
-
-    float grams;
-    if (hx711_grams(&grams)) {
-        n += snprintf(msg + n, len - n, " | weight %.0f g", grams);
-    } else {
-        snprintf(msg + n, len - n, " | weight n/a");
+        ESP_LOGW(TAG, "sip detected but not connected: %d mL", ml);
     }
 }
 
-static void button_task(void *arg) {
-    gpio_config_t io_conf = {
+// Block until the load cell reading settles (small spread across reads) and
+// return the averaged weight in grams. Bails out early if the cup gets tilted,
+// so a drink starting mid-read doesn't stall this for the full timeout.
+static bool read_stable_weight(float *grams_out) {
+    float w[3];
+    int idx = 0, count = 0;
+    int64_t t0 = esp_timer_get_time();
+    while (esp_timer_get_time() - t0 < (int64_t)SETTLE_TIMEOUT_MS * 1000) {
+        float t;
+        if (tilt_angle_deg(&t) && t >= TILT_DRINK_DEG) return false;
+        float g;
+        if (!hx711_grams(&g)) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        w[idx % 3] = g;
+        idx++;
+        count++;
+        if (count >= 3) {
+            float lo = w[0], hi = w[0];
+            for (int i = 1; i < 3; i++) {
+                if (w[i] < lo) lo = w[i];
+                if (w[i] > hi) hi = w[i];
+            }
+            if (hi - lo <= WEIGHT_STABLE_G) {
+                *grams_out = (w[0] + w[1] + w[2]) / 3.0f;
+                return true;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return false;
+}
+
+// Tilt-gated weight-delta detector. Holds a stable upright "baseline" weight;
+// when the cup is tilted to drink and then returns upright, the drop in weight
+// is the amount consumed. Tilts beyond TILT_POUROUT_DEG are treated as the cup
+// being emptied out and produce no reading.
+static void drink_detect_task(void *arg) {
+    if (!adxl_ok || !hx711_ok) {
+        ESP_LOGE(TAG, "drink detect disabled: adxl_ok=%d hx711_ok=%d", adxl_ok, hx711_ok);
+        vTaskDelete(NULL);
+        return;
+    }
+    if (!grav_ref_ok) {
+        ESP_LOGW(TAG, "no upright reference; tilt measured from default pose");
+    }
+
+    gpio_config_t btn = {
         .pin_bit_mask = (1ULL << BUTTON_GPIO),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
     };
-    gpio_config(&io_conf);
+    gpio_config(&btn);
+    bool btn_last = true;  // pulled up: high when not pressed
 
-    char msg[200];
-    bool last_state = true; // pulled up = high when not pressed
-    while (1) {
-        bool current = gpio_get_level(BUTTON_GPIO);
-        // Button press = falling edge (active low)
-        if (last_state && !current) {
-            ESP_LOGI(TAG, "button pressed");
-            build_message(msg, sizeof(msg));
-            if (connected) {
-                struct os_mbuf *om = ble_hs_mbuf_from_flat(msg, strlen(msg));
-                ble_gatts_notify_custom(conn_handle, char_val_handle, om);
-                ESP_LOGI(TAG, "sent: %s", msg);
-            } else {
-                ESP_LOGW(TAG, "not connected: %s", msg);
-            }
-            vTaskDelay(pdMS_TO_TICKS(300)); // debounce
-        }
-        last_state = current;
-        vTaskDelay(pdMS_TO_TICKS(20));
+    float baseline = 0.0f;
+    while (!read_stable_weight(&baseline)) {
+        ESP_LOGW(TAG, "waiting for a stable initial weight...");
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
-}
+    ESP_LOGI(TAG, "baseline weight = %.0f g", baseline);
 
-static void sensor_debug_task(void *arg) {
+    bool drinking = false;
+    float max_tilt = 0.0f;
+    int64_t last_baseline_us = esp_timer_get_time();
+
     while (1) {
-        uint8_t devid = 0xFF;
-        esp_err_t e = adxl_dev ? adxl345_read(ADXL345_REG_DEVID, &devid, 1) : ESP_FAIL;
-        float x = 0, y = 0, z = 0;
-        adxl345_read_g(&x, &y, &z);
-        int32_t raw = 0;
-        bool got = hx711_read_raw(&raw);
-        ESP_LOGI(TAG,
-                 "diag: adxl[i2c=%s devid=0x%02x] x=%.2f y=%.2f z=%.2f g | hx[read=%s raw=%ld]",
-                 e == ESP_OK ? "ok" : "ERR", devid, x, y, z,
-                 got ? "ok" : "TIMEOUT", (long)raw);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        // BOOT button = manual re-tare: re-learn upright pose and reset baseline.
+        bool btn = gpio_get_level(BUTTON_GPIO);
+        if (btn_last && !btn) {
+            ESP_LOGI(TAG, "re-tare requested");
+            capture_upright_ref();
+            float w;
+            if (read_stable_weight(&w)) {
+                baseline = w;
+                last_baseline_us = esp_timer_get_time();
+                ESP_LOGI(TAG, "re-tared: baseline=%.0f g", baseline);
+            } else {
+                ESP_LOGW(TAG, "re-tare: weight not stable, baseline unchanged");
+            }
+            drinking = false;
+            vTaskDelay(pdMS_TO_TICKS(300));  // debounce
+        }
+        btn_last = btn;
+
+        float tilt;
+        if (!tilt_angle_deg(&tilt)) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (!drinking) {
+            if (tilt >= TILT_DRINK_DEG) {
+                drinking = true;
+                max_tilt = tilt;
+                ESP_LOGI(TAG, "drinking started (tilt=%.0f, baseline=%.0f g)",
+                         tilt, baseline);
+            } else if (tilt <= TILT_UPRIGHT_DEG &&
+                       esp_timer_get_time() - last_baseline_us > BASELINE_REFRESH_US) {
+                // Upright and idle: refresh baseline so refills/drift are tracked.
+                float w;
+                if (read_stable_weight(&w)) baseline = w;
+                last_baseline_us = esp_timer_get_time();
+            }
+        } else {
+            if (tilt > max_tilt) max_tilt = tilt;
+            if (tilt <= TILT_UPRIGHT_DEG) {
+                // Back upright: settle and compare against the baseline.
+                float after;
+                if (read_stable_weight(&after)) {
+                    float delta = baseline - after;
+                    if (max_tilt > TILT_POUROUT_DEG) {
+                        ESP_LOGI(TAG, "pour-out ignored (max tilt=%.0f, delta=%.0f g)",
+                                 max_tilt, delta);
+                    } else if (delta >= MIN_SIP_G) {
+                        send_ml((int)(delta / WATER_DENSITY_G_PER_ML + 0.5f));
+                    } else {
+                        ESP_LOGI(TAG, "no sip (delta=%.0f g, max tilt=%.0f)",
+                                 delta, max_tilt);
+                    }
+                    baseline = after;
+                    last_baseline_us = esp_timer_get_time();
+                }
+                drinking = false;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -382,6 +506,7 @@ void app_main(void) {
 
     adxl345_init();
     hx711_init();
+    capture_upright_ref();
 
     nimble_port_init();
     ble_att_set_preferred_mtu(247); // allow longer notifications
@@ -394,6 +519,5 @@ void app_main(void) {
     ble_hs_cfg.sync_cb = ble_on_sync;
 
     nimble_port_freertos_init(nimble_host_task);
-    xTaskCreate(button_task, "button", 4096, NULL, 5, NULL);
-    xTaskCreate(sensor_debug_task, "sensordbg", 4096, NULL, 4, NULL);
+    xTaskCreate(drink_detect_task, "drink", 4096, NULL, 5, NULL);
 }
